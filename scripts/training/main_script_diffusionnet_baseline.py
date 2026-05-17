@@ -1,23 +1,33 @@
+# pyright: reportMissingImports=false
+
 """
-PointTransformer Regression Baseline — K-Fold + Patient-Based Split
-===================================================================
-Single-stage PointTransformer baseline for 9-landmark regression.
+DiffusionNet Regression Baseline — K-Fold + Patient-Based Split
+================================================================
+Single-stage DiffusionNet baseline for 9-landmark regression.
 
-Design goals:
-- Keep baseline simple (no hybrid patch refiner / no cascade)
-- Keep split leakage-safe (patient-based holdout + patient-level CV)
-- Keep training stable (grad clip, full-epoch schedule)
-- Keep outputs reproducible and resumable (live JSON snapshots)
+Policy source:
+- mirrors scripts/training/main_script_pointtransformer_kfold.py
+  - patient-based 80/20 holdout
+  - patient-level inner K-fold on the train split
+  - full-epoch training (no early stopping)
+  - live JSON progress snapshots
+  - post-CV retrain on the full train split
 
-Default baseline profile (tuned for your project):
-- epochs=200
-- lr=3e-4
-- dims=128,256,512  (PT v2-style capacity used in your prior PT references)
-- n_pts=2048,512,128; k=16; pre_fps_n=4096
+DiffusionNet safety handling source:
+- refers to scripts/training/train_heatmap_joint_hybrid_diffnet_floor_v1_kfold.py
+- refers to scripts/training/train_heatmap_joint_hybrid_diffnet_floor_v1_phase1_search.py
+
+Safety design goals:
+- Prefer CUDA DiffusionNet runtime when available (`diffnet_device="auto"`)
+- Keep `k_eig=64` by default to avoid heavy eigendecomposition stalls
+- Use cached operators in data/diffnet_op_cache
+- Never add fake batch dimensions to sparse operators
+- Use `num_workers=0` and modest batch sizes
 """
 
 import os
 import sys
+import gc
 import json
 import copy
 import shutil
@@ -32,7 +42,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import KFold
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -44,12 +54,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
 UTILS_DIR = os.path.join(ROOT_DIR, "scripts", "utils")
 MODELS_DIR = os.path.join(ROOT_DIR, "models")
-for p in (ROOT_DIR, UTILS_DIR, MODELS_DIR, BASE_DIR):
+DIFFNET_SRC = os.path.join(ROOT_DIR, "diffusion-net-repo", "src")
+OP_CACHE_DIR = os.path.join(ROOT_DIR, "data", "diffnet_op_cache")
+
+for p in (ROOT_DIR, UTILS_DIR, MODELS_DIR, BASE_DIR, DIFFNET_SRC):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import diffusion_net
 import train_heatmap_joint_flip_v3 as base
-from models.point_transformer_reg import PointTransformerReg
 
 NUM_LANDMARKS = 9
 OUTPUT_DIM = NUM_LANDMARKS * 3
@@ -57,7 +70,12 @@ LANDMARK_NAMES = base.LANDMARK_NAMES
 ALARE_R_IDX, ALARE_L_IDX = 5, 6
 ZYGION_R_IDX, ZYGION_L_IDX = 7, 8
 
-# Determinism
+DIFFNET_C_WIDTH = 128
+DIFFNET_N_BLOCK = 4
+DIFFNET_K_EIG = 64
+DIFFNET_INPUT_FEATURES = "xyz"
+DIFFNET_HEAD_DROPOUT = 0.3
+
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 try:
@@ -65,8 +83,16 @@ try:
 except TypeError:
     torch.use_deterministic_algorithms(True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"device: {device}")
+
+def resolve_diffnet_device(mode: str) -> torch.device:
+    mode = str(mode).lower()
+    if mode == "cpu":
+        return torch.device("cpu")
+    if mode == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--diffnet-device cuda was requested, but CUDA is not available.")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_global_seed(seed: int):
@@ -76,18 +102,6 @@ def set_global_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-
-def build_model(args):
-    return PointTransformerReg(
-        output_dim=OUTPUT_DIM,
-        dropout=args.dropout,
-        dims=args.pt_dims,
-        n_pts=args.pt_npts,
-        k=args.pt_k,
-        pre_fps_n=args.pt_pre_fps_n,
-        normal_channel=False,
-    ).to(device)
 
 
 def patient_id_from_name(folder_name: str) -> str:
@@ -115,10 +129,10 @@ def patient_based_split(names, test_fraction=0.20, seed=42):
     return np.array(sorted(train_idx)), np.array(sorted(test_idx))
 
 
-def patient_kfold(names_subset, indices_subset, k=5, seed=42):
+def patient_kfold(names, indices_subset, k=5, seed=42):
     patient_to_local = defaultdict(list)
     for local_i, global_i in enumerate(indices_subset):
-        pid = patient_id_from_name(names_subset[global_i])
+        pid = patient_id_from_name(names[global_i])
         patient_to_local[pid].append(local_i)
 
     patients = sorted(patient_to_local.keys())
@@ -133,82 +147,336 @@ def patient_kfold(names_subset, indices_subset, k=5, seed=42):
         yield np.array(tr_local), np.array(val_local)
 
 
-def augment_batch(batch_pc, batch_lbl):
-    B, _, N = batch_pc.shape
-    dev = batch_pc.device
+def precompute_diffnet_operators(verts_list, faces_list, k_eig=DIFFNET_K_EIG, op_cache_dir=None):
+    if op_cache_dir is not None:
+        os.makedirs(op_cache_dir, exist_ok=True)
 
-    theta = torch.rand(B, device=dev) * (2 * np.pi / 12) - (np.pi / 12)
-    cos_t = torch.cos(theta)
-    sin_t = torch.sin(theta)
+    print(f"[DiffNet] Precomputing operators for {len(verts_list)} samples (k_eig={k_eig}) ...")
+    ops_list = []
+    from tqdm import tqdm
+
+    for i in tqdm(range(len(verts_list)), desc="DiffNet operators", ascii=True, file=sys.stdout):
+        verts = verts_list[i]
+        faces = faces_list[i]
+        try:
+            frames, mass, L, evals, evecs, gradX, gradY = diffusion_net.geometry.get_operators(
+                verts,
+                faces,
+                k_eig=k_eig,
+                op_cache_dir=op_cache_dir,
+            )
+        except Exception as e:
+            fallback_k = min(int(k_eig), 32)
+            print(
+                f"\n[DiffNet] WARNING: operator computation failed for sample {i} "
+                f"(V={verts.shape[0]}): {e}"
+            )
+            print(f"[DiffNet] Retrying with k_eig={fallback_k} ...")
+            frames, mass, L, evals, evecs, gradX, gradY = diffusion_net.geometry.get_operators(
+                verts,
+                faces,
+                k_eig=fallback_k,
+                op_cache_dir=op_cache_dir,
+            )
+        ops_list.append((frames, mass, L, evals, evecs, gradX, gradY))
+
+    print(f"[DiffNet] Operators ready for {len(ops_list)} samples.")
+    return ops_list
+
+
+def compute_hks_features(evals, evecs, num_features=16):
+    return diffusion_net.geometry.compute_hks_autoscale(evals, evecs, num_features)
+
+
+def load_data_with_diffnet_ops(k_eig=DIFFNET_K_EIG, input_features=DIFFNET_INPUT_FEATURES, op_cache_dir=None):
+    X, Y, scales, names, full_clouds, triangles = base.load_data()
+
+    verts_list = []
+    faces_list = []
+    for i in range(len(names)):
+        verts_t = torch.from_numpy(full_clouds[i]).float()
+        tri = triangles[i]
+        if tri is not None and len(tri) > 0:
+            faces_t = torch.from_numpy(tri).long()
+        else:
+            faces_t = torch.zeros((0, 3), dtype=torch.long)
+        verts_list.append(verts_t)
+        faces_list.append(faces_t)
+
+    ops_list = precompute_diffnet_operators(
+        verts_list,
+        faces_list,
+        k_eig=k_eig,
+        op_cache_dir=op_cache_dir,
+    )
+
+    diffnet_data = []
+    for i in range(len(names)):
+        frames, mass, L, evals, evecs, gradX, gradY = ops_list[i]
+        verts = verts_list[i]
+        if input_features == "hks":
+            features = compute_hks_features(evals, evecs, num_features=16)
+        else:
+            features = verts
+
+        diffnet_data.append(
+            {
+                "verts": verts,
+                "mass": mass,
+                "L": L,
+                "evals": evals,
+                "evecs": evecs,
+                "gradX": gradX,
+                "gradY": gradY,
+                "features": features,
+            }
+        )
+
+    return X, Y, scales, names, full_clouds, triangles, diffnet_data
+
+
+class DiffusionNetRegressor(nn.Module):
+    def __init__(
+        self,
+        output_dim=OUTPUT_DIM,
+        c_in=3,
+        c_width=DIFFNET_C_WIDTH,
+        n_block=DIFFNET_N_BLOCK,
+        global_dim=256,
+        head_dropout=DIFFNET_HEAD_DROPOUT,
+        diffnet_dropout=True,
+    ):
+        super().__init__()
+        self.global_dim = int(global_dim)
+        self.backbone = diffusion_net.layers.DiffusionNet(
+            C_in=c_in,
+            C_out=self.global_dim,
+            C_width=c_width,
+            N_block=n_block,
+            last_activation=None,
+            outputs_at="global_mean",
+            dropout=diffnet_dropout,
+            with_gradient_features=True,
+            with_gradient_rotations=True,
+            diffusion_method="spectral",
+        )
+        self.head = nn.Sequential(
+            nn.Linear(self.global_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(head_dropout),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(head_dropout),
+            nn.Linear(256, output_dim),
+        )
+
+    def forward(self, features, mass, L, evals, evecs, gradX, gradY):
+        global_feat = self.backbone(
+            features,
+            mass,
+            L=L,
+            evals=evals,
+            evecs=evecs,
+            gradX=gradX,
+            gradY=gradY,
+        )
+        pred = self.head(global_feat)
+        return pred
+
+
+class DiffNetRegressionDataset(Dataset):
+    def __init__(self, X, Y, indices, diffnet_data):
+        self.X = X
+        self.Y = Y
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.diffnet_data = diffnet_data
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        idx = int(self.indices[i])
+        return self.X[idx], self.Y[idx], self.diffnet_data[idx], idx
+
+
+def diffnet_collate_fn(batch):
+    pcs, gts, dd_list, idxs = zip(*batch)
+    pc_tensor = torch.from_numpy(np.stack(pcs)).float()
+    gt_tensor = torch.from_numpy(np.stack(gts)).float()
+    idx_tensor = torch.tensor(idxs, dtype=torch.long)
+    return pc_tensor, gt_tensor, list(dd_list), idx_tensor
+
+
+def make_diffnet_loader(X, Y, indices, diffnet_data, batch_size, shuffle):
+    ds = DiffNetRegressionDataset(X, Y, indices, diffnet_data)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=diffnet_collate_fn,
+        num_workers=0,
+        drop_last=False,
+    )
+
+
+def augment_diffnet_batch(pc, lbl, dd_list, dev, flip_prob=0.2):
+    pc = pc.to(dev)
+    lbl = lbl.to(dev)
+    B, _, N = pc.shape
+
+    th = torch.rand(B, 1, 1, device=dev) * (2 * np.pi / 12) - np.pi / 12
+    c, s = torch.cos(th), torch.sin(th)
     rot = torch.zeros(B, 3, 3, device=dev)
-    rot[:, 0, 0] = cos_t
-    rot[:, 0, 1] = -sin_t
-    rot[:, 1, 0] = sin_t
-    rot[:, 1, 1] = cos_t
+    rot[:, 0, 0] = c.flatten()
+    rot[:, 0, 1] = -s.flatten()
+    rot[:, 1, 0] = s.flatten()
+    rot[:, 1, 1] = c.flatten()
     rot[:, 2, 2] = 1.0
 
-    pc_t = batch_pc.transpose(1, 2)
-    pc_r = torch.bmm(pc_t, rot)
-    lbl_r = torch.bmm(batch_lbl, rot)
+    pc_r = torch.bmm(pc.transpose(1, 2), rot)
+    lbl_r = torch.bmm(
+        lbl.view(B * NUM_LANDMARKS, 1, 3),
+        rot.repeat_interleave(NUM_LANDMARKS, dim=0),
+    ).view(B, NUM_LANDMARKS, 3)
 
-    scale = torch.rand(B, 1, 1, device=dev) * 0.10 + 0.95
-    pc_r = pc_r * scale
-    lbl_r = lbl_r * scale
+    sc = torch.rand(B, 1, 1, device=dev) * 0.10 + 0.95
+    pc_r = pc_r * sc
+    lbl_r = lbl_r * sc
 
-    shift = (torch.rand(B, 1, 3, device=dev) * 0.04) - 0.02
-    pc_r = pc_r + shift
-    lbl_r = lbl_r + shift
+    sh = torch.rand(B, 1, 3, device=dev) * 0.04 - 0.02
+    pc_r = pc_r + sh
+    lbl_r = lbl_r + sh
 
     pc_r = pc_r + torch.randn(B, N, 3, device=dev) * 0.005
-    return pc_r.transpose(1, 2), lbl_r
+
+    flip_idx = (torch.rand(B, device=dev) < float(flip_prob)).nonzero(as_tuple=True)[0]
+    flip_set = set(int(x) for x in flip_idx.cpu().tolist())
+    if len(flip_set) > 0:
+        pc_r[flip_idx, :, 0] = -pc_r[flip_idx, :, 0]
+        lbl_r[flip_idx, :, 0] = -lbl_r[flip_idx, :, 0]
+
+        saved_alare_r = lbl_r[flip_idx, ALARE_R_IDX].clone()
+        lbl_r[flip_idx, ALARE_R_IDX] = lbl_r[flip_idx, ALARE_L_IDX]
+        lbl_r[flip_idx, ALARE_L_IDX] = saved_alare_r
+
+        saved_zygion_r = lbl_r[flip_idx, ZYGION_R_IDX].clone()
+        lbl_r[flip_idx, ZYGION_R_IDX] = lbl_r[flip_idx, ZYGION_L_IDX]
+        lbl_r[flip_idx, ZYGION_L_IDX] = saved_zygion_r
+
+    augmented_dd_list = []
+    for b_idx in range(B):
+        dd = dd_list[b_idx]
+        dd_aug = {}
+        for key in ["mass", "L", "evals", "evecs", "gradX", "gradY"]:
+            dd_aug[key] = dd[key]
+
+        features = dd["features"]
+        if features.shape[-1] == 3:
+            feat_dev = features.to(dev)
+            feat_r = torch.mm(feat_dev, rot[b_idx])
+            feat_r = feat_r * sc[b_idx, 0, 0]
+            feat_r = feat_r + sh[b_idx, 0, :]
+            if b_idx in flip_set:
+                feat_r[:, 0] = -feat_r[:, 0]
+            dd_aug["features"] = feat_r.cpu()
+        else:
+            dd_aug["features"] = features
+        augmented_dd_list.append(dd_aug)
+
+    return pc_r.transpose(1, 2), lbl_r, augmented_dd_list
 
 
-def maybe_flip(batch_pc, batch_lbl, prob=0.2):
-    B = batch_pc.size(0)
-    mask = (torch.rand(B, device=batch_pc.device) < prob)
-    for b in range(B):
-        if bool(mask[b]):
-            batch_pc[b, 0, :] *= -1
-            batch_lbl[b, :, 0] *= -1
-            saved_alare_r = batch_lbl[b, ALARE_R_IDX].clone()
-            batch_lbl[b, ALARE_R_IDX] = batch_lbl[b, ALARE_L_IDX]
-            batch_lbl[b, ALARE_L_IDX] = saved_alare_r
-            saved_zygion_r = batch_lbl[b, ZYGION_R_IDX].clone()
-            batch_lbl[b, ZYGION_R_IDX] = batch_lbl[b, ZYGION_L_IDX]
-            batch_lbl[b, ZYGION_L_IDX] = saved_zygion_r
-    return batch_pc, batch_lbl
+def build_model(args, runtime_device):
+    c_in = 3 if args.input_features == "xyz" else 16
+    model = DiffusionNetRegressor(
+        output_dim=OUTPUT_DIM,
+        c_in=c_in,
+        c_width=args.diffnet_c_width,
+        n_block=args.diffnet_n_block,
+        global_dim=args.diffnet_global_dim,
+        head_dropout=args.dropout,
+        diffnet_dropout=True,
+    ).to(runtime_device)
+    return model
 
 
-def evaluate_mm(model, X_np, Y_np, scales_np, batch_size=8):
-    pred = predict_in_batches(model, X_np, batch_size=batch_size)
+def run_diffusion_batch(model, dd_list, runtime_device):
+    preds = []
+    for dd in dd_list:
+        features = dd["features"].to(runtime_device)
+        mass = dd["mass"].to(runtime_device)
+        L = dd["L"].to(runtime_device)
+        evals = dd["evals"].to(runtime_device)
+        evecs = dd["evecs"].to(runtime_device)
+        gradX = dd["gradX"].to(runtime_device)
+        gradY = dd["gradY"].to(runtime_device)
+
+        pred = model(features, mass, L, evals, evecs, gradX, gradY)
+        if pred.dim() == 1:
+            pred = pred.unsqueeze(0)
+        preds.append(pred)
+
+        del features, mass, L, evals, evecs, gradX, gradY
+
+    out = torch.cat(preds, dim=0)
+    if runtime_device.type == "cuda":
+        torch.cuda.synchronize(runtime_device)
+    return out
+
+
+def predict_in_batches(model, X_np, indices, diffnet_data, batch_size=4, runtime_device=torch.device("cpu")):
+    model.eval()
+    loader = make_diffnet_loader(
+        X_np,
+        np.zeros((len(X_np), NUM_LANDMARKS, 3), dtype=np.float32),
+        indices,
+        diffnet_data,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    preds = []
+    with torch.no_grad():
+        for _, _, dd_list, _ in loader:
+            pred = run_diffusion_batch(model, dd_list, runtime_device)
+            preds.append(pred.cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def evaluate_mm(model, X_np, Y_np, scales_np, indices, diffnet_data, batch_size=4, runtime_device=torch.device("cpu")):
+    pred = predict_in_batches(model, X_np, indices, diffnet_data, batch_size=batch_size, runtime_device=runtime_device)
     pred_lm = pred.reshape(-1, NUM_LANDMARKS, 3)
-    return np.linalg.norm(pred_lm - Y_np, axis=2) * scales_np[:, None]
+    gt = Y_np[indices]
+    sc = scales_np[indices]
+    return np.linalg.norm(pred_lm - gt, axis=2) * sc[:, None]
 
 
-def evaluate_mm_with_snap_mesh(model, X_np, Y_np, scales_np, full_clouds, triangles, batch_size=8):
-    pred = predict_in_batches(model, X_np, batch_size=batch_size).reshape(-1, NUM_LANDMARKS, 3)
-
-    errs_raw = np.linalg.norm(pred - Y_np, axis=2) * scales_np[:, None]
+def evaluate_mm_with_snap_mesh(
+    model,
+    X_np,
+    Y_np,
+    scales_np,
+    indices,
+    diffnet_data,
+    full_clouds,
+    triangles,
+    batch_size=4,
+    runtime_device=torch.device("cpu"),
+):
+    pred = predict_in_batches(model, X_np, indices, diffnet_data, batch_size=batch_size, runtime_device=runtime_device)
+    pred = pred.reshape(-1, NUM_LANDMARKS, 3)
+    gt = Y_np[indices]
+    sc = scales_np[indices]
+    errs_raw = np.linalg.norm(pred - gt, axis=2) * sc[:, None]
 
     snapped = np.empty_like(pred, dtype=np.float32)
-    for i in range(pred.shape[0]):
-        pc_full = full_clouds[i]
-        tri = triangles[i] if triangles is not None else None
+    for i, abs_idx in enumerate(indices):
+        pc_full = full_clouds[int(abs_idx)]
+        tri = triangles[int(abs_idx)] if triangles is not None else None
         for k in range(NUM_LANDMARKS):
             snapped[i, k] = base.snap_to_mesh(pred[i, k], pc_full, tri)
 
-    errs_snap = np.linalg.norm(snapped - Y_np, axis=2) * scales_np[:, None]
+    errs_snap = np.linalg.norm(snapped - gt, axis=2) * sc[:, None]
     return errs_raw, errs_snap
-
-
-def predict_in_batches(model, X_np, batch_size=8):
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for start in range(0, len(X_np), batch_size):
-            xb = torch.from_numpy(X_np[start:start + batch_size]).float().to(device)
-            preds.append(model(xb).cpu().numpy())
-    return np.concatenate(preds, axis=0)
 
 
 def print_eval(tag, errs):
@@ -222,17 +490,27 @@ def print_eval(tag, errs):
     print(f"  {'OVERALL':<12} {flat.mean():>7.3f} {np.median(flat):>7.3f} {np.percentile(flat,90):>7.3f}  (mm)")
 
 
+def _atomic_json_dump(payload, path):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
 def train_kfold(args):
     set_global_seed(int(args.seed))
+    runtime_device = resolve_diffnet_device(args.diffnet_device)
 
     print("\n" + "=" * 68)
-    print("  PointTransformer Baseline — Configuration")
+    print("  DiffusionNet Baseline — Configuration")
     print("=" * 68)
-    print(f"  {'Model':<26}: PointTransformerReg output_dim={OUTPUT_DIM}")
-    print(f"  {'PT dims':<26}: {args.pt_dims}")
-    print(f"  {'PT n_pts':<26}: {args.pt_npts}")
-    print(f"  {'PT k / pre_fps_n':<26}: {args.pt_k} / {args.pt_pre_fps_n}")
-    print(f"  {'Device':<26}: {device}")
+    print(f"  {'Model':<26}: DiffusionNetRegressor output_dim={OUTPUT_DIM}")
+    print(f"  {'DiffNet c_width':<26}: {args.diffnet_c_width}")
+    print(f"  {'DiffNet n_block':<26}: {args.diffnet_n_block}")
+    print(f"  {'DiffNet global_dim':<26}: {args.diffnet_global_dim}")
+    print(f"  {'DiffNet k_eig':<26}: {args.k_eig}")
+    print(f"  {'Input features':<26}: {args.input_features}")
+    print(f"  {'Runtime device':<26}: {runtime_device}")
     print(f"  {'K-Folds':<26}: {args.k_folds}")
     print(f"  {'Seed':<26}: {args.seed}")
     print(f"  {'Split':<26}: patient-based {int((1-args.test_fraction)*100)}/{int(args.test_fraction*100)}")
@@ -241,11 +519,15 @@ def train_kfold(args):
     print(f"  {'Grad clip norm':<26}: {args.grad_clip_norm}")
     print(f"  {'Early stop':<26}: disabled (full epochs)")
     print(f"  {'Loss':<26}: SmoothL1")
-    print(f"  {'Print interval':<26}: every {args.print_interval} epochs")
+    print(f"  {'Op cache':<26}: {OP_CACHE_DIR}")
     print(f"  {'Run tag':<26}: {args.run_tag if args.run_tag else '(none)'}")
     print("=" * 68 + "\n")
 
-    X, Y, scales, names, full_clouds, triangles = base.load_data()
+    X, Y, scales, names, full_clouds, triangles, diffnet_data = load_data_with_diffnet_ops(
+        k_eig=args.k_eig,
+        input_features=args.input_features,
+        op_cache_dir=OP_CACHE_DIR,
+    )
     print(f"Total samples loaded: {len(X)}")
 
     train_idx, test_idx = patient_based_split(names, test_fraction=args.test_fraction, seed=args.seed)
@@ -260,17 +542,6 @@ def train_kfold(args):
     if n_inner != args.k_folds:
         print(f"[warn] k_folds={args.k_folds} > train_patients={len(train_patients)}; using n_splits={n_inner}")
 
-    Xtr_full = X[train_idx]
-    Ytr_full = Y[train_idx]
-    Str_full = scales[train_idx]
-    names_arr = np.array(names)
-
-    X_test = X[test_idx]
-    Y_test = Y[test_idx]
-    S_test = scales[test_idx]
-    full_clouds_test = [full_clouds[i] for i in test_idx]
-    triangles_test = [triangles[i] for i in test_idx] if triangles is not None else None
-
     criterion = nn.SmoothL1Loss()
     fold_results = []
     all_histories = []
@@ -278,7 +549,7 @@ def train_kfold(args):
     best_fold_idx = -1
 
     split_tag = f"patient{int((1-args.test_fraction)*100)}_{int(args.test_fraction*100)}"
-    exp_name = args.exp_name or f"{args.exp_id}_pt_single_{split_tag}_mesh16384"
+    exp_name = args.exp_name or f"{args.exp_id}_diffnet_single_{split_tag}_mesh16384"
     seed_tag = f"seed{args.seed}"
     run_name = f"{exp_name}_{seed_tag}"
 
@@ -304,7 +575,7 @@ def train_kfold(args):
             "experiment_id": args.exp_id,
             "experiment_name": exp_name,
             "run_name": run_name,
-            "model": "PointTransformerReg (baseline)",
+            "model": "DiffusionNetRegressor (baseline)",
             "seed": args.seed,
             "split": f"patient-based {int((1-args.test_fraction)*100)}/{int(args.test_fraction*100)}",
             "train_patients": len(train_patients),
@@ -323,12 +594,16 @@ def train_kfold(args):
                 "early_stopping": False,
                 "max_points": base.MAX_POINTS,
                 "sampling": "mesh-uniform (fallback: FPS)",
-                "pt_dims": list(args.pt_dims),
-                "pt_n_pts": list(args.pt_npts),
-                "pt_k": args.pt_k,
-                "pt_pre_fps_n": args.pt_pre_fps_n,
+                "diffnet_c_width": args.diffnet_c_width,
+                "diffnet_n_block": args.diffnet_n_block,
+                "diffnet_global_dim": args.diffnet_global_dim,
+                "k_eig": args.k_eig,
+                "input_features": args.input_features,
+                "diffnet_device": str(runtime_device),
                 "eval_batch_size": args.eval_batch_size,
                 "retrain_use_cv_epoch": bool(args.retrain_use_cv_epoch),
+                "flip_prob": args.flip_prob,
+                "operator_cache": OP_CACHE_DIR,
             },
             "k_folds": args.k_folds,
             "k_folds_effective": int(n_inner),
@@ -342,13 +617,11 @@ def train_kfold(args):
             "test_results": test_results,
             "training_histories": all_histories,
         }
-        tmp_path = history_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, history_path)
+        _atomic_json_dump(payload, history_path)
 
     save_progress(status="running", current_fold=0, current_epoch=0)
 
+    names_arr = np.array(names)
     for fold_idx, (tr_loc, val_loc) in enumerate(
         patient_kfold(names_arr, train_idx, k=n_inner, seed=args.seed), start=1
     ):
@@ -356,20 +629,17 @@ def train_kfold(args):
         print(f"  FOLD {fold_idx}/{n_inner}  |  train={len(tr_loc)}  val={len(val_loc)}")
         print(f"{'='*60}")
 
-        X_tr, Y_tr = Xtr_full[tr_loc], Ytr_full[tr_loc]
-        X_va, Y_va = Xtr_full[val_loc], Ytr_full[val_loc]
-        S_va = Str_full[val_loc]
+        tr_abs = train_idx[tr_loc]
+        val_abs = train_idx[val_loc]
 
-        model = build_model(args)
+        model = build_model(args, runtime_device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
             step_size=max(1, args.lr_decay_step),
             gamma=args.lr_decay_gamma,
         )
-
-        train_ds = TensorDataset(torch.from_numpy(X_tr).float(), torch.from_numpy(Y_tr).float())
-        train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
+        train_dl = make_diffnet_loader(X, Y, tr_abs, diffnet_data, batch_size=args.batch_size, shuffle=True)
 
         best_val_mm = float("inf")
         best_state = None
@@ -381,14 +651,18 @@ def train_kfold(args):
             current_lr = float(optimizer.param_groups[0]["lr"])
             train_loss_acc, n_batches = 0.0, 0
 
-            for batch_pc, batch_lbl in train_dl:
-                batch_pc, batch_lbl = augment_batch(batch_pc, batch_lbl)
-                batch_pc, batch_lbl = maybe_flip(batch_pc, batch_lbl, prob=args.flip_prob)
-                batch_pc = batch_pc.to(device)
-                batch_lbl_flat = batch_lbl.reshape(batch_lbl.size(0), -1).to(device)
+            for batch_pc, batch_lbl, dd_list, _ in train_dl:
+                batch_pc, batch_lbl, dd_list_aug = augment_diffnet_batch(
+                    batch_pc,
+                    batch_lbl,
+                    dd_list,
+                    runtime_device,
+                    flip_prob=args.flip_prob,
+                )
+                batch_lbl_flat = batch_lbl.reshape(batch_lbl.size(0), -1)
 
                 optimizer.zero_grad()
-                pred = model(batch_pc)
+                pred = run_diffusion_batch(model, dd_list_aug, runtime_device)
                 loss = criterion(pred, batch_lbl_flat)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
@@ -398,7 +672,16 @@ def train_kfold(args):
                 n_batches += 1
 
             avg_train = train_loss_acc / max(n_batches, 1)
-            val_errs = evaluate_mm(model, X_va, Y_va, S_va, batch_size=args.eval_batch_size)
+            val_errs = evaluate_mm(
+                model,
+                X,
+                Y,
+                scales,
+                val_abs,
+                diffnet_data,
+                batch_size=args.eval_batch_size,
+                runtime_device=runtime_device,
+            )
             val_mm = float(val_errs.mean())
 
             history["epoch"].append(epoch)
@@ -426,11 +709,29 @@ def train_kfold(args):
 
         model_prefix = run_name
         fold_path = os.path.join(run_dir, f"{model_prefix}_fold{fold_idx}_best.pth")
-        torch.save(best_state, fold_path)
+        torch.save(
+            {
+                "model": best_state,
+                "config": vars(args),
+                "runtime_device": str(runtime_device),
+                "best_epoch": int(best_epoch),
+                "best_val_mm": float(best_val_mm),
+            },
+            fold_path,
+        )
         print(f"  -> Fold {fold_idx} best val L2 = {best_val_mm:.3f} mm  saved: {fold_path}")
 
         model.load_state_dict(best_state)
-        val_errs_lm = evaluate_mm(model, X_va, Y_va, S_va, batch_size=args.eval_batch_size)
+        val_errs_lm = evaluate_mm(
+            model,
+            X,
+            Y,
+            scales,
+            val_abs,
+            diffnet_data,
+            batch_size=args.eval_batch_size,
+            runtime_device=runtime_device,
+        )
         print_eval(f"Fold {fold_idx} val", val_errs_lm)
 
         fold_results.append(
@@ -438,8 +739,8 @@ def train_kfold(args):
                 "fold": fold_idx,
                 "best_val_mm": float(best_val_mm),
                 "best_epoch": int(best_epoch),
-                "train_scans": int(len(tr_loc)),
-                "val_scans": int(len(val_loc)),
+                "train_scans": int(len(tr_abs)),
+                "val_scans": int(len(val_abs)),
                 "per_landmark_val_mm": val_errs_lm.mean(axis=0).tolist(),
             }
         )
@@ -450,6 +751,11 @@ def train_kfold(args):
             best_fold_idx = fold_idx
 
         save_progress(status="running", current_fold=fold_idx, current_epoch=args.epochs)
+
+        del model, optimizer, scheduler, train_dl, best_state
+        gc.collect()
+        if runtime_device.type == "cuda":
+            torch.cuda.empty_cache()
 
     model_prefix = run_name
     best_fold_path = os.path.join(run_dir, f"{model_prefix}_fold{best_fold_idx}_best.pth")
@@ -467,15 +773,14 @@ def train_kfold(args):
         retrain_epochs = int(args.epochs)
     print(f"  Retrain epochs: {retrain_epochs} (cv_best_epochs={cv_best_epochs})")
 
-    full_model = build_model(args)
+    full_model = build_model(args, runtime_device)
     optimizer = torch.optim.Adam(full_model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=max(1, args.lr_decay_step),
         gamma=args.lr_decay_gamma,
     )
-    train_full_ds = TensorDataset(torch.from_numpy(Xtr_full).float(), torch.from_numpy(Ytr_full).float())
-    train_full_dl = DataLoader(train_full_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    train_full_dl = make_diffnet_loader(X, Y, train_idx, diffnet_data, batch_size=args.batch_size, shuffle=True)
     retrain_history = {"phase": "retrain_full_train", "epoch": [], "train_loss": [], "lr": []}
 
     for epoch in range(1, retrain_epochs + 1):
@@ -483,14 +788,18 @@ def train_kfold(args):
         current_lr = float(optimizer.param_groups[0]["lr"])
         train_loss_acc, n_batches = 0.0, 0
 
-        for batch_pc, batch_lbl in train_full_dl:
-            batch_pc, batch_lbl = augment_batch(batch_pc, batch_lbl)
-            batch_pc, batch_lbl = maybe_flip(batch_pc, batch_lbl, prob=args.flip_prob)
-            batch_pc = batch_pc.to(device)
-            batch_lbl_flat = batch_lbl.reshape(batch_lbl.size(0), -1).to(device)
+        for batch_pc, batch_lbl, dd_list, _ in train_full_dl:
+            batch_pc, batch_lbl, dd_list_aug = augment_diffnet_batch(
+                batch_pc,
+                batch_lbl,
+                dd_list,
+                runtime_device,
+                flip_prob=args.flip_prob,
+            )
+            batch_lbl_flat = batch_lbl.reshape(batch_lbl.size(0), -1)
 
             optimizer.zero_grad()
-            pred = full_model(batch_pc)
+            pred = run_diffusion_batch(full_model, dd_list_aug, runtime_device)
             loss = criterion(pred, batch_lbl_flat)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(full_model.parameters(), max_norm=args.grad_clip_norm)
@@ -513,24 +822,33 @@ def train_kfold(args):
     all_histories.append(retrain_history)
 
     retrain_final_path = os.path.join(run_dir, f"{model_prefix}_retrain_fulltrain_final.pth")
-    torch.save(full_model.state_dict(), retrain_final_path)
+    torch.save(
+        {
+            "model": full_model.state_dict(),
+            "config": vars(args),
+            "runtime_device": str(runtime_device),
+            "retrain_epochs": int(retrain_epochs),
+        },
+        retrain_final_path,
+    )
     print(f"Retrained full-train model saved: {retrain_final_path}")
 
-    best_model = build_model(args)
-    try:
-        state_dict = torch.load(retrain_final_path, map_location=device, weights_only=True)
-    except TypeError:
-        state_dict = torch.load(retrain_final_path, map_location=device)
+    best_model = build_model(args, runtime_device)
+    ckpt = torch.load(retrain_final_path, map_location=runtime_device, weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
     best_model.load_state_dict(state_dict)
 
     test_errs_raw, test_errs_snap = evaluate_mm_with_snap_mesh(
         best_model,
-        X_test,
-        Y_test,
-        S_test,
-        full_clouds_test,
-        triangles_test,
+        X,
+        Y,
+        scales,
+        test_idx,
+        diffnet_data,
+        full_clouds,
+        triangles,
         batch_size=args.eval_batch_size,
+        runtime_device=runtime_device,
     )
 
     print_eval("TEST SET (held-out, raw)", test_errs_raw)
@@ -538,7 +856,7 @@ def train_kfold(args):
 
     final_test_results = {
         "primary_metric": "snap_mesh",
-        "n_scans": int(len(X_test)),
+        "n_scans": int(len(test_idx)),
         "raw": {
             "overall_mean": float(test_errs_raw.mean()),
             "overall_median": float(np.median(test_errs_raw)),
@@ -573,7 +891,7 @@ def train_kfold(args):
         writer = csv.writer(f)
         writer.writerow(["sample_index", "raw_mean_mm", "snap_mesh_mean_mm"])
         for i in range(test_errs_raw.shape[0]):
-            writer.writerow([i, float(test_errs_raw[i].mean()), float(test_errs_snap[i].mean())])
+            writer.writerow([int(test_idx[i]), float(test_errs_raw[i].mean()), float(test_errs_snap[i].mean())])
 
     holdout_payload = {
         "experiment_id": args.exp_id,
@@ -588,6 +906,7 @@ def train_kfold(args):
         "evaluation_model": "retrain_full_train",
         "cv_selected_model_path": cv_selected_model_path,
         "final_retrained_model_path": retrain_final_path,
+        "runtime_device": str(runtime_device),
         "test_results": final_test_results,
     }
     with open(result_path, "w", encoding="utf-8") as f:
@@ -602,7 +921,7 @@ def train_kfold(args):
 
     val_mms = [r["best_val_mm"] for r in fold_results]
     print("\n" + "=" * 60)
-    print("  TRAINING COMPLETE — PointTransformer Baseline")
+    print("  TRAINING COMPLETE — DiffusionNet Baseline")
     print("=" * 60)
     print(f"  CV mean val : {np.mean(val_mms):.3f} ± {np.std(val_mms):.3f} mm")
     print(
@@ -623,25 +942,27 @@ def get_config():
     cfg = SimpleNamespace(
         seed=42,
         seeds=(17, 42, 123),
-        exp_id="F02",
-        exp_name="F02_pt_single_patient80_20_mesh16384",
+        exp_id="D01",
+        exp_name="D01_diffnet_single_patient80_20_mesh16384",
         test_fraction=0.20,
         k_folds=5,
         epochs=200,
-        batch_size=8,
-        lr=3e-4,
+        batch_size=2,
+        lr=2e-4,
         lr_decay_step=100,
         lr_decay_gamma=0.7,
         dropout=0.3,
         grad_clip_norm=1.0,
         flip_prob=0.2,
-        eval_batch_size=8,
+        eval_batch_size=4,
         retrain_use_cv_epoch=True,
         print_interval=20,
-        pt_dims=(128, 256, 512),
-        pt_npts=(2048, 512, 128),
-        pt_k=16,
-        pt_pre_fps_n=4096,
+        diffnet_c_width=DIFFNET_C_WIDTH,
+        diffnet_n_block=DIFFNET_N_BLOCK,
+        diffnet_global_dim=256,
+        k_eig=DIFFNET_K_EIG,
+        input_features=DIFFNET_INPUT_FEATURES,
+        diffnet_device="cuda",
         run_tag="",
     )
     cfg.seeds = tuple(int(s) for s in cfg.seeds)

@@ -18,7 +18,7 @@ sys.path.insert(0, str(TRAINING_DIR.parent))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import train_heatmap_joint_flip_v3 as base
-from scripts.training.train_heatmap_joint_hybrid_pt_patch_floor_v1_kfold import (
+from scripts.training.train_script_pointtransformer_c2f import (
     UnifiedCoarseFineNet,
     predict_unified,
     RADIUS_MIN_BY_LM,

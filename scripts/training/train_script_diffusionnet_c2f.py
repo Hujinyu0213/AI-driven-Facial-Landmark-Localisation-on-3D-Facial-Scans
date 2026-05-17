@@ -53,7 +53,7 @@ if DIFFNET_SRC not in sys.path:
 
 import diffusion_net
 
-import train_heatmap_joint_flip_v3 as base
+import scripts.training.train_script_pointnet2_c2f as base
 
 N_LANDMARKS = base.N_LANDMARKS
 LANDMARK_NAMES = base.LANDMARK_NAMES

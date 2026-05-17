@@ -38,7 +38,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-import train_heatmap_joint_flip_v3 as base
+import scripts.training.train_script_pointnet2_c2f as base
 import train_heatmap_joint_flip_v5_cascade_soft_roi as soft_roi
 
 N_LANDMARKS = base.N_LANDMARKS

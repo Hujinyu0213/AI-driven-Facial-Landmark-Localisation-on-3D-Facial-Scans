@@ -48,7 +48,7 @@ for p in (ROOT_DIR, UTILS_DIR, MODELS_DIR, BASE_DIR):
         sys.path.insert(0, p)
 
 # Import shared data-loading utilities (same preprocessing as all recent scripts)
-import train_heatmap_joint_flip_v3 as base
+import scripts.training.train_script_pointnet2_c2f as base
 
 from models.pointnet2_reg import PointNet2RegMSG
 
